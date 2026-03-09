@@ -128,6 +128,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
+        # Fused KQV projection: one Linear computes [K, Q, V] (3 * n_embd) in a single matmul.
         qkv = self.c_attn(x)
         q, k, v = qkv.split(C, dim=2)
 
@@ -135,6 +136,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
+        # Fused attention kernel (SDPA): dispatches to optimized backends (e.g., Flash attention) when available.
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -235,21 +237,26 @@ class GPT(nn.Module):
         top_p=1.0,
     ):
         for _ in range(max_new_tokens):
+            # Autoregressive generation: only feed the most recent context window.
             idx_cond = idx[:, -self.block_size :]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
 
+            # temperature<=0 switches to deterministic greedy decoding.
             if temperature <= 0:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
                 idx = torch.cat((idx, next_token), dim=1)
                 continue
 
+            # Temperature scaling: lower -> sharper/more deterministic, higher -> more random.
             logits = logits / temperature
 
+            # Top-k: keep only the k highest-logit tokens, mask the rest.
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("inf")
 
+            # Top-p (nucleus): keep smallest token set whose cumulative prob >= top_p.
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
@@ -261,6 +268,7 @@ class GPT(nn.Module):
                 mask.scatter_(1, sorted_indices, sorted_mask)
                 logits = logits.masked_fill(mask, -float("inf"))
 
+            # Sample next token from the filtered distribution.
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_token), dim=1)
@@ -272,6 +280,7 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device):
 
     decay_params = []
     nodecay_params = []
+    # Proper AdamW parameter grouping: decay for matrix weights, no decay for biases/LayerNorm/1D params.
     for name, p in param_dict.items():
         if p.dim() >= 2 and "ln_" not in name and "bias" not in name:
             decay_params.append(p)
@@ -283,6 +292,7 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device):
         {"params": nodecay_params, "weight_decay": 0.0},
     ]
 
+    # Optional fused AdamW path on CUDA when this PyTorch build exposes fused=True.
     fused_ok = device == "cuda" and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
     if fused_ok:
         optimizer = torch.optim.AdamW(
@@ -301,10 +311,13 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device):
 
 
 def get_lr(it, warmup_iters, lr, min_lr, max_iters):
+    # Linear warmup: ramp from 0 -> base lr during early iterations.
     if it < warmup_iters:
         return lr * (it + 1) / warmup_iters
+    # After training budget, keep a floor learning rate.
     if it > max_iters:
         return min_lr
+    # Cosine decay from base lr -> min_lr after warmup.
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (lr - min_lr)
@@ -364,6 +377,7 @@ def main():
 
     print(f"params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
+    # Optional graph compilation (PyTorch 2.x): can speed up training/inference after compile overhead.
     if cfg.compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
         print("model compiled with torch.compile")
@@ -378,6 +392,7 @@ def main():
 
     os.makedirs(cfg.out_dir, exist_ok=True)
 
+    # Mixed precision autocast on CUDA: run ops in bf16/fp16 where safe, keep others in fp32.
     autocast_enabled = device == "cuda" and ptdtype in (torch.float16, torch.bfloat16)
     autocast_ctx = (
         torch.autocast(device_type=device, dtype=ptdtype, enabled=autocast_enabled)
@@ -385,12 +400,15 @@ def main():
         else nullcontext()
     )
 
+    # Gradient scaling is needed for fp16 to avoid underflow; it is disabled for bf16/fp32.
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and ptdtype == torch.float16))
 
     best_val = float("inf")
 
     for it in range(cfg.max_iters + 1):
+        # Per-step LR from warmup + cosine schedule.
         lr = get_lr(it, cfg.warmup_iters, cfg.learning_rate, cfg.min_lr, cfg.max_iters)
+        # Apply the scheduled LR to all optimizer parameter groups.
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -420,8 +438,10 @@ def main():
                 }
                 torch.save(ckpt, os.path.join(cfg.out_dir, "ckpt.pt"))
 
+        # Clear grads once per optimizer step (after all accumulation micro-steps).
         optimizer.zero_grad(set_to_none=True)
 
+        # Gradient accumulation: run multiple micro-batches before one optimizer step.
         for _ in range(cfg.gradient_accumulation_steps):
             xb, yb = get_batch(
                 "train",
@@ -431,14 +451,20 @@ def main():
                 cfg.batch_size,
                 device,
             )
+            # Forward/loss run under autocast (bf16/fp16 on CUDA).
             with autocast_ctx:
                 _, loss = model(xb, yb)
+                # Normalize so accumulated gradients match the full-batch average.
                 loss = loss / cfg.gradient_accumulation_steps
 
+            # Scale loss before backward for fp16 stability (no-op when scaler is disabled).
             scaler.scale(loss).backward()
 
+        # Unscale before grad clipping so clipping sees true gradient magnitudes.
+        # Gradient clipping: cap global grad norm to stabilize training.
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        # Optimizer step + dynamic scale update (both become regular step behavior when disabled).
         scaler.step(optimizer)
         scaler.update()
 
